@@ -5,11 +5,12 @@ from app.services.hasura import (
     fetch_unparsed_prospects, 
     update_prospect_name,fetch_autostart_campaigns,
      update_campaign_active_status,
-     fetch_call_and_prompt_data,
-     insert_call_data
+     insert_multiple_call_data,
+     get_agent_prompt_and_count, 
+     get_calls_by_batch
 
 )
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor,as_completed
 import time
 from app.services.auth import check_auth
 from app.services.helper import determine_campaign_status
@@ -124,55 +125,88 @@ def toggle_campaigns():
         return {"success": False, "message": "Unexpected server error occurred."}
 
 
-
-import time
-
-@router.post("/admin-vocallabs")
+@router.post("/PCA-batching")
 async def admin_vocallabs(body: PostcallRequest):
     start_total = time.time()
+    agent_id = body.input.agent_id
+    is_premium = body.input.is_premium
+    _gte = body.input.from_date
+    _lte = body.input.to_date
 
-    # Fetch GraphQL data
-    print("📡 Fetching GraphQL data...")
-    data_start = time.time()
-    data = fetch_call_and_prompt_data(body.input.agent_id, body.input.call_id)
-    print(f"✅ GraphQL fetch took {time.time() - data_start:.2f}s")
+    print(f"📡 Fetching agent prompt templates and call count...")
+    agent_data = get_agent_prompt_and_count(agent_id)
+    total_calls = agent_data["calls_aggregate"]["aggregate"]["count"]
+    prompts = agent_data["agent_post_data_collections"]
 
-    agent_data = data["data"]["vocallabs_agent"]
-    call_data = data["data"]["vocallabs_calls"]
+    if total_calls == 0:
+        raise HTTPException(status_code=404, detail="No completed calls found")
 
-    if not agent_data or not call_data:
-        raise HTTPException(status_code=404, detail="Agent or call data not found")
+    print(f"📞 Total calls: {total_calls} | 🧠 Prompts per call: {len(prompts)}")
 
-    prompts = agent_data[0]["agent_post_data_collections"]
-    transcript = call_data[0]["post_call_transcript"]
-    messages = call_data[0]["call_messages"]
+    batch_size = 100
+    loop_count = math.ceil(total_calls / batch_size)
+    print(f"🔁 {loop_count} batches of {batch_size} calls each")
 
-    if not transcript and not messages:
-        raise HTTPException(status_code=400, detail="No transcript or messages available")
+    def process_batch(offset: int) -> int:
+        print(f"\n🚀 Processing batch at offset {offset}")
+        calls = get_calls_by_batch(agent_id, _gte, _lte, offset, batch_size, is_premium)
+        batch_results: List[Dict] = []
 
-    if not body.input.is_premium:
-        transcript = "\n".join([f"{msg['role']}: {msg['content'].strip()}" for msg in messages])
+        for call in calls:
+            call_id = call["call_id"]
+            transcript = call.get("post_call_transcript")
+            messages = call.get("call_messages")
 
-    print(f"🧠 Total prompts to evaluate: {len(prompts)}")
+            if not transcript and not messages:
+                print(f"⚠️ Skipping call {call_id} — no transcript or messages.")
+                continue
 
-    # Evaluate prompts one by one
-    for i, item in enumerate(prompts):
-        print(f"\n--- Prompt {i+1}/{len(prompts)} ---")
-        full_prompt = f"{item['prompt']}\n\n\nChat Transcript:\n{transcript}\n\n\n"
-        print(f"🔍 key: {item['key']} | Prompt size: {len(full_prompt)} chars")
+            if not is_premium:
+                transcript = "\n".join([f"{msg['role']}: {msg['content'].strip()}" for msg in messages])
 
-        # Time LLM evaluation
-        llm_start = time.time()
-        result = evaluate_prompt(full_prompt)
-        print(f"🧠 LLM evaluation took {time.time() - llm_start:.2f}s → result: {result}")
+            print(f"📞 Call {call_id} — {len(prompts)} prompt(s)")
 
-        # Time GraphQL mutation
-        gql_start = time.time()
-        insert_call_data(key=item["key"], value=result, call_id=body.input.call_id)
-        print(f"📝 Mutation took {time.time() - gql_start:.2f}s")
+            for item in prompts:
+                full_prompt = f"{item['prompt']}\n\n\nChat Transcript:\n{transcript}\n\n\n"
+                print(f"🔍 key: {item['key']} | Prompt size: {len(full_prompt)} chars")
 
-    print(f"\n✅ All prompts done in {time.time() - start_total:.2f}s")
+                llm_start = time.time()
+                result = evaluate_prompt(full_prompt)
+                print(f"🧠 LLM took {time.time() - llm_start:.2f}s → result: {result}")
 
+                batch_results.append({
+                    "key": item["key"],
+                    "value": result,
+                    "call_id": call_id
+                })
+
+        # Perform single batch mutation to Hasura
+        if batch_results:
+            hasura_objects = [
+                {
+                    "key": entry["key"],
+                    "value": entry["value"],
+                    "call_id": entry["call_id"],
+                    "type": "external"
+                } for entry in batch_results
+            ]
+            print(f"📤 Inserting {len(hasura_objects)} prompt results to Hasura...")
+            insert_multiple_call_data(hasura_objects)
+            print(f"✅ Batch inserted to Hasura")
+
+        return len(batch_results)
+
+    # ThreadPoolExecutor for batching
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(process_batch, offset * batch_size)
+            for offset in range(loop_count)
+        ]
+        total_prompts = 0
+        for future in as_completed(futures):
+            total_prompts += future.result()
+
+    print(f"\n🎉 All calls processed in {time.time() - start_total:.2f}s")
     return {
-        "message": f"Successfully processed {len(prompts)} prompt(s)."
+        "message": f"Processed {total_calls} calls and inserted {total_prompts} prompts."
     }
