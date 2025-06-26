@@ -2,6 +2,8 @@ import requests
 import time
 import pandas as pd
 from app.config import HASURA_URL, HASURA_HEADERS
+from typing import List, Dict
+
 
 def fetch_unparsed_prospects(prospect_id):
     query = """
@@ -72,6 +74,8 @@ def fetch_autostart_campaigns():
 
     """
     try:
+        print("📡 Sending request to Hasura...")
+        start_time = time.time()
         response = requests.post(
             HASURA_URL,
             headers=HASURA_HEADERS,
@@ -112,72 +116,119 @@ def update_campaign_active_status(campaign_id, active):
         print(f"Error updating campaign {campaign_id}: {e}")
         return None
 
-
-def fetch_call_and_prompt_data(agent_id: str, call_id: str):
+def get_agent_prompt_and_count(agent_id: str):
     query = """
-    query MyQuery($agent_id: uuid, $call_id: uuid) {
-      vocallabs_agent(where: {id: {_eq: $agent_id}}) {
-        agent_post_data_collections { key prompt }
-      }
-      vocallabs_calls(where: {id: {_eq: $call_id}, call_status: {_eq: "completed"}}) {
-        post_call_transcript
-        call_messages { 
-          role 
-          content 
+    query AgentAggregatePrompts($_eq: uuid!) {
+      vocallabs_agent(where: {id: {_eq: $_eq}}) {
+        calls_aggregate(where: {call_status: {_eq: "completed"}}) {
+          aggregate {
+            count
+          }
+        }
+        agent_post_data_collections {
+          prompt
+          key
         }
       }
     }
     """
-    variables = {"agent_id": agent_id, "call_id": call_id}
+    variables = {"_eq": agent_id}
+    response = requests.post(
+        HASURA_URL,
+        headers=HASURA_HEADERS,
+        json={"query": query, "variables": variables}
+    )
+    response.raise_for_status()
+    return response.json()["data"]["vocallabs_agent"][0]
 
-    try:
-        print("📡 Sending request to Hasura...")
-        start_time = time.time()
+def get_calls_by_batch(agent_id: str, gte: str, lte: str, offset: int, limit: int, is_premium: bool):
+    if is_premium:
+        query = """
+        query CallBatchPremium($_eq: uuid!, $_gte: timestamptz!, $_lte: timestamptz!, $offset: Int!, $limit: Int!) {
+          vocallabs_calls(
+            where: {agent_id: {_eq: $_eq}, created_at: {_gte: $_gte, _lte: $_lte}},
+            limit: $limit,
+            offset: $offset
+          ) {
+            call_id
+            call_messages {
+              role
+              content
+            }
+          }
+        }
+        """
+    else:
+        query = """
+        query CallBatchNonPremium($_eq: uuid!, $_gte: timestamptz!, $_lte: timestamptz!, $offset: Int!, $limit: Int!) {
+          vocallabs_calls(
+            where: {agent_id: {_eq: $_eq}, created_at: {_gte: $_gte, _lte: $_lte}},
+            limit: $limit,
+            offset: $offset
+          ) {
+            call_id
+            post_call_transcript
+          }
+        }
+        """
 
-        response = requests.post(
-            HASURA_URL,
-            json={"query": query, "variables": variables},
-            headers=HASURA_HEADERS,
-            timeout=10  # ⏱️ force fail if >10s
-        )
+    variables = {
+        "_eq": agent_id,
+        "_gte": gte,
+        "_lte": lte,
+        "offset": offset,
+        "limit": limit
+    }
 
-        duration = time.time() - start_time
-        print(f"✅ Hasura responded in {duration:.2f} seconds")
-
-        response.raise_for_status()
-        return response.json()
-
-    except requests.exceptions.Timeout:
-        print("⏰ Timeout when calling Hasura")
-        raise
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Hasura error: {e}")
-        raise
+    response = requests.post(
+        HASURA_URL,
+        headers=HASURA_HEADERS,
+        json={"query": query, "variables": variables}
+    )
+    response.raise_for_status()
+    return response.json()["data"]["vocallabs_calls"]
 
 
-def insert_call_data(key: str, value: str, call_id: str, data_type: str = "external"):
+
+def insert_multiple_call_data(entries: List[Dict]):
     mutation = """
-    mutation MyMutation($key: String!, $value: String!, $call_id: uuid!, $type: String!) {
+    mutation InsertMany($objects: [vocallabs_call_data_insert_input!]!) {
       insert_vocallabs_call_data(
-        objects: {key: $key, value: $value, call_id: $call_id, type: $type},
-      
-        on_conflict: {constraint: call_data_call_id_key_key, update_columns: value}
+        objects: $objects,
+        on_conflict: {
+          constraint: call_data_call_id_key_key,
+          update_columns: value
+        }
       ) {
         affected_rows
       }
     }
     """
-    variables = {
-        "key": key,
-        "value": value,
-        "call_id": call_id,
-        "type": data_type
-    }
+    variables = {"objects": entries}
+
     response = requests.post(
         HASURA_URL,
-        json={"query": mutation, "variables": variables},
-        headers=HASURA_HEADERS
+        headers=HASURA_HEADERS,
+        json={"query": mutation, "variables": variables}
     )
     response.raise_for_status()
     return response.json()
+
+
+def fetch_call_ids_by_agent(agent_id: str):
+    query = """
+    query MyQuery($_eq: uuid = "") {
+  vocallabs_call_message(where: {call: {agent_id: {_eq: $_eq}, call_status: {_eq: "completed"}}}) {
+    call_id
+  }
+}
+
+    """
+    variables = {"_eq": agent_id}
+    response = requests.post(
+        HASURA_URL,
+        headers=HASURA_HEADERS,
+        json={"query": query, "variables": variables}
+    )
+    return response.json()
+
