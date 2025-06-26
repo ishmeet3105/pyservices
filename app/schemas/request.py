@@ -1,4 +1,15 @@
 from pydantic import BaseModel, Field
+from typing import Optional
+from datetime import datetime
+
+class InputData(BaseModel):
+    agent_id: str
+    from_date: datetime
+    to_date: datetime
+    is_premium: Optional[bool] = False  # optional, defaults to False
+
+class PostcallRequest(BaseModel):
+    input: InputData
 
 class HeaderModel(BaseModel):
     Authorization: str
@@ -12,12 +23,5 @@ class ProspectInputModel(BaseModel):
 class ProspectRequest(BaseModel):
     input: ProspectInputModel
 
-class postcall_request(BaseModel):
-    agent_id: str
-    call_id: str
-    client_id: str
-    is_premium: bool
-    batch_size: int
 
-class PostcallRequest(BaseModel):
-    input: postcall_request
+
